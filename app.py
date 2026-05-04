@@ -1,7 +1,868 @@
-""" CFO Executive Dashboard — Streamlit Web App (v2) Upload a multi-entity P&L workbook → view an interactive dark-theme dashboard → area-by-area breakdowns → download the completed Excel file. Now with authentication (password + optional SSO-ready hooks). """ import streamlit as st import pandas as pd import numpy as np import plotly.graph_objects as go import plotly.express as px from plotly.subplots import make_subplots import openpyxl from openpyxl.styles import Font, PatternFill, Alignment, Border, Side from openpyxl.utils import get_column_letter import io import re import hashlib import hmac import time st.set_page_config( page_title="CFO Executive Dashboard", page_icon="📊", layout="wide", initial_sidebar_state="expanded", ) COLORS = { "bg_primary": "#1E1E2E", "bg_header": "#353548", "bg_odd": "#2A2A3C", "bg_even": "#323245", "bg_kpi": "#2A2A3E", "text_primary": "#FFFFFF", "text_secondary": "#E0E0E0", "text_muted": "#B0B0B0", "text_dim": "#78909C", "accent": "#4FC3F7", "accent_alt": "#42A5F5", "positive": "#66BB6A", "negative": "#EF5350", "warning": "#FFB74D", "highlight": "#FFD600", } CHART_COLORS = ["#78909C", "#90A4AE", "#4FC3F7", "#42A5F5", "#66BB6A", "#FF8A65"] AREA_COLORS = ["#4FC3F7", "#66BB6A", "#FFB74D", "#EF5350", "#AB47BC", "#FF8A65", "#26C6DA", "#9CCC65"] USERS = { "admin": { "password_hash": hashlib.sha256("admin123".encode()).hexdigest(), "name": "Administrator", "role": "admin", }, "cfo": { "password_hash": hashlib.sha256("cfo2024".encode()).hexdigest(), "name": "Chief Financial Officer", "role": "executive", }, "analyst": { "password_hash": hashlib.sha256("analyst2024".encode()).hexdigest(), "name": "Financial Analyst", "role": "analyst", }, "viewer": { "password_hash": hashlib.sha256("view2024".encode()).hexdigest(), "name": "Board Viewer", "role": "viewer", }, } ROLE_PERMISSIONS = { "admin": {"dashboard": True, "trends": True, "areas": True, "scenarios": True, "export": True, "manage_users": True}, "executive": {"dashboard": True, "trends": True, "areas": True, "scenarios": True, "export": True, "manage_users": False}, "analyst": {"dashboard": True, "trends": True, "areas": True, "scenarios": True, "export": False, "manage_users": False}, "viewer": {"dashboard": True, "trends": False, "areas": False, "scenarios": False, "export": False, "manage_users": False}, } def check_password(username, password): if username not in USERS: return False expected_hash = USERS[username]["password_hash"] actual_hash = hashlib.sha256(password.encode()).hexdigest() return hmac.compare_digest(expected_hash, actual_hash) def get_user_permissions(username): role = USERS.get(username, {}).get("role", "viewer") return ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["viewer"]) def render_login_page(): st.markdown(f""" <style> .stApp {{ background-color: {COLORS["bg_primary"]}; }} .login-container {{ max-width: 400px; margin: 80px auto; padding: 40px; background: {COLORS["bg_kpi"]}; border-radius: 12px; border-top: 3px solid {COLORS["accent"]}; }} .login-title {{ color: {COLORS["accent"]}; font-size: 24px; font-weight: 700; text-align: center; margin-bottom: 8px; }} .login-subtitle {{ color: {COLORS["text_dim"]}; font-size: 13px; text-align: center; margin-bottom: 24px; }} </style> """, unsafe_allow_html=True) col1, col2, col3 = st.columns([1, 2, 1]) with col2: st.markdown('<div class="login-container"><div class="login-title">📊 CFO Dashboard</div><div class="login-subtitle">Sign in to access the executive dashboard</div></div>', unsafe_allow_html=True) with st.form("login_form"): username = st.text_input("Username", placeholder="Enter your username") password = st.text_input("Password", type="password", placeholder="Enter your password") submitted = st.form_submit_button("Sign In", use_container_width=True, type="primary") if submitted: if check_password(username, password): st.session_state["authenticated"] = True st.session_state["username"] = username st.session_state["user_name"] = USERS[username]["name"] st.session_state["role"] = USERS[username]["role"] st.session_state["login_time"] = time.time() st.rerun() else: st.error("❌ Invalid username or password") st.markdown(f'<div style="text-align:center; margin-top:20px;"><p style="color:{COLORS["text_dim"]}; font-size:11px;">Default accounts: admin/admin123, cfo/cfo2024, analyst/analyst2024, viewer/view2024<br><em>Change these passwords before deploying to production!</em></p></div>', unsafe_allow_html=True) def inject_css(): st.markdown(f""" <style> .stApp {{ background-color: {COLORS["bg_primary"]}; }} .main .block-container {{ padding-top: 1rem; max-width: 1400px; }} h1, h2, h3 {{ color: {COLORS["accent"]} !important; }} p, span, label, .stMarkdown {{ color: {COLORS["text_secondary"]} !important; }} .kpi-card {{ background: {COLORS["bg_kpi"]}; border-radius: 8px; padding: 16px 20px; text-align: center; min-height: 110px; }} .kpi-label {{ color: {COLORS["text_muted"]}; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }} .kpi-value {{ font-size: 28px; font-weight: 700; color: {COLORS["text_primary"]}; line-height: 1.2; }} .kpi-sub {{ color: {COLORS["text_dim"]}; font-size: 11px; margin-top: 4px; }} .section-title {{ color: {COLORS["accent"]} !important; font-size: 16px; font-weight: 700; margin: 30px 0 12px 0; letter-spacing: 0.5px; }} .area-card {{ background: {COLORS["bg_odd"]}; border-radius: 8px; padding: 14px 18px; min-height: 90px; border-left: 4px solid {COLORS["accent"]}; }} .area-name {{ color: {COLORS["accent"]}; font-size: 13px; font-weight: 700; margin-bottom: 4px; }} .area-metric {{ color: {COLORS["text_primary"]}; font-size: 20px; font-weight: 700; line-height: 1.3; }} .area-sub {{ color: {COLORS["text_dim"]}; font-size: 10px; }} .user-badge {{ background: {COLORS["bg_header"]}; color: {COLORS["text_muted"]}; padding: 6px 12px; border-radius: 6px; font-size: 11px; display: inline-block; }} .stTabs [data-baseweb="tab-list"] {{ gap: 8px; }} .stTabs [data-baseweb="tab"] {{ background-color: {COLORS["bg_header"]}; color: {COLORS["text_muted"]}; border-radius: 6px 6px 0 0; padding: 8px 20px; }} .stTabs [aria-selected="true"] {{ background-color: {COLORS["accent_alt"]} !important; color: white !important; }} </style> """, unsafe_allow_html=True)
-def find_row_by_label(df, keywords, col_idx=0, exact=False): for i, val in enumerate(df.iloc[:, col_idx]): if pd.isna(val): continue val_str = str(val).strip().lower() for kw in keywords: if exact: if val_str == kw.lower(): return i else: if kw.lower() in val_str: return i return None def find_fy_columns(df): fy_cols = {} for row_idx in range(min(5, len(df))): for col_idx in range(len(df.columns)): val = df.iloc[row_idx, col_idx] if pd.isna(val): continue val_str = str(val).strip() match = re.search(r'(?:FY\s*)?(\d{4})\s*(?:Total|Budget|Bgt|Actual|Act)?', val_str, re.IGNORECASE) if match and 'total' in val_str.lower(): year = match.group(1) key = f"FY{year}" fy_cols[key] = col_idx return fy_cols def find_monthly_columns(df, fy_total_col): if fy_total_col is None or fy_total_col < 12: return [] return list(range(fy_total_col - 12, fy_total_col)) def discover_pl_structure(df): structure = {} row_map = { "revenue_lines": [], "total_revenue": find_row_by_label(df, ["total revenue", "total rev", "net revenue"]), "total_cos": find_row_by_label(df, ["total cost of services", "total cos", "cost of services total", "total cogs", "cost of goods"]), "total_gm": find_row_by_label(df, ["total gross margin", "gross margin", "gross profit"]), "gm_pct": find_row_by_label(df, ["gross margin %", "gm %", "gm%", "gross margin percent"]), "emp_comp": find_row_by_label(df, ["employee compensation", "employee comp", "salaries", "payroll", "compensation"]), "rent": find_row_by_label(df, ["rent & facilities", "rent", "facilities", "occupancy"]), "other_direct": find_row_by_label(df, ["other direct", "other operating"]), "total_direct": find_row_by_label(df, ["total direct costs", "total direct", "total operating expenses"]), "cm": find_row_by_label(df, ["contribution margin", "operating margin"]), "cm_pct": find_row_by_label(df, ["contribution margin %", "cm %", "cm%"]), "oi": find_row_by_label(df, ["operating income", "net income", "ebitda", "ebit"]), } if row_map["total_revenue"]: for i in range(max(0, row_map["total_revenue"] - 15), row_map["total_revenue"]): val = df.iloc[i, 0] if pd.isna(val): continue val_str = str(val).strip() if val_str and "total" not in val_str.lower() and "revenue" not in val_str.lower(): has_data = False for c in range(1, min(len(df.columns), 20)): if pd.notna(df.iloc[i, c]) and isinstance(df.iloc[i, c], (int, float)): has_data = True break if has_data: row_map["revenue_lines"].append({"name": val_str, "row": i}) structure["rows"] = row_map fy_cols = find_fy_columns(df) structure["fy_columns"] = fy_cols monthly = {} for fy_key, col_idx in fy_cols.items(): monthly[fy_key] = find_monthly_columns(df, col_idx) structure["monthly_columns"] = monthly return structure def extract_pl_data(df, structure): rows = structure["rows"] fy_cols = structure["fy_columns"] monthly = structure["monthly_columns"] data = { "fy_labels": sorted(fy_cols.keys()), "annual": {}, "monthly_revenue": {}, "monthly_gm_pct": {}, "monthly_cm_pct": {}, "service_lines": [], } for fy, col in sorted(fy_cols.items()): annual = {} for key in ["total_revenue", "total_cos", "total_gm", "gm_pct", "emp_comp", "rent", "other_direct", "total_direct", "cm", "cm_pct", "oi"]: row_idx = rows.get(key) if row_idx is not None and col < len(df.columns): val = df.iloc[row_idx, col] annual[key] = float(val) if pd.notna(val) and isinstance(val, (int, float)) else 0 else: annual[key] = 0 data["annual"][fy] = annual month_labels = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun"] for fy, cols in sorted(monthly.items()): if not cols: continue for metric_key, row_key in [("monthly_revenue", "total_revenue"), ("monthly_gm_pct", "gm_pct"), ("monthly_cm_pct", "cm_pct")]: row_idx = rows.get(row_key) if row_idx is not None: vals = [] for c in cols: v = df.iloc[row_idx, c] if c < len(df.columns) else 0 vals.append(float(v) if pd.notna(v) and isinstance(v, (int, float)) else 0) data[metric_key][fy] = vals data["month_labels"] = month_labels for sl in rows.get("revenue_lines", []): sl_data = {"name": sl["name"]} for fy, col in sorted(fy_cols.items()): val = df.iloc[sl["row"], col] if col < len(df.columns) else 0 sl_data[fy] = float(val) if pd.notna(val) and isinstance(val, (int, float)) else 0 data["service_lines"].append(sl_data) return data def discover_area_sheets(sheet_names, consolidated_name): areas = [] skip_patterns = ["consolidated", "dashboard", "fte", "supervision", "chart", "template", "summary", "discontinued", "new sites", "_chartdata"] for name in sheet_names: name_lower = name.lower() if name_lower == consolidated_name.lower(): continue if any(s in name_lower for s in skip_patterns): continue if "p&l" in name_lower or "p_l" in name_lower or "pl" in name_lower: if name_lower != consolidated_name.lower(): areas.append(name) return areas def extract_area_data(file_bytes, area_sheet_name, consolidated_structure): df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=area_sheet_name, header=None) area_structure = discover_pl_structure(df) if not area_structure["fy_columns"]: area_structure["fy_columns"] = consolidated_structure["fy_columns"] area_structure["monthly_columns"] = consolidated_structure["monthly_columns"] area_data = extract_pl_data(df, area_structure) area_data["sheet_name"] = area_sheet_name display_name = area_sheet_name for suffix in ["_P&L", "_PL", " P&L", " PL", "_p&l"]: display_name = display_name.replace(suffix, "") area_data["display_name"] = display_name.strip() return area_data
-def plotly_layout(title="", height=350): return dict( title=dict(text=title, font=dict(color=COLORS["text_secondary"], size=14)), paper_bgcolor=COLORS["bg_primary"], plot_bgcolor=COLORS["bg_primary"], font=dict(family="Segoe UI, sans-serif", color=COLORS["text_muted"], size=11), legend=dict(font=dict(color=COLORS["text_muted"], size=10), orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5), margin=dict(l=50, r=20, t=50, b=60), height=height, xaxis=dict(gridcolor="#3A3A50", zerolinecolor="#3A3A50"), yaxis=dict(gridcolor="#3A3A50", zerolinecolor="#3A3A50"), ) def chart_revenue_trend(data): fig = go.Figure() months = data["month_labels"] for i, (fy, vals) in enumerate(sorted(data["monthly_revenue"].items())): color = CHART_COLORS[i % len(CHART_COLORS)] fig.add_trace(go.Scatter(x=months, y=[v / 1000 for v in vals], name=fy, line=dict(color=color, width=2), mode="lines+markers", marker=dict(size=4))) fig.update_layout(**plotly_layout("Monthly Revenue Trend ($K)")) fig.update_yaxes(title_text="Revenue ($K)") return fig def chart_gm_trend(data): fig = go.Figure() months = data["month_labels"] for i, (fy, vals) in enumerate(sorted(data["monthly_gm_pct"].items())): color = CHART_COLORS[i % len(CHART_COLORS)] pct_vals = [v * 100 if abs(v) < 1 else v for v in vals] fig.add_trace(go.Scatter(x=months, y=pct_vals, name=fy, line=dict(color=color, width=2), mode="lines+markers", marker=dict(size=4))) fig.update_layout(**plotly_layout("Gross Margin % Trend")) fig.update_yaxes(title_text="GM %", ticksuffix="%") return fig def chart_cm_trend(data): fig = go.Figure() months = data["month_labels"] for i, (fy, vals) in enumerate(sorted(data["monthly_cm_pct"].items())): color = CHART_COLORS[i % len(CHART_COLORS)] pct_vals = [v * 100 if abs(v) < 1 else v for v in vals] fig.add_trace(go.Scatter(x=months, y=pct_vals, name=fy, line=dict(color=color, width=2), mode="lines+markers", marker=dict(size=4))) fig.update_layout(**plotly_layout("Contribution Margin % Trend")) fig.update_yaxes(title_text="CM %", ticksuffix="%") return fig def chart_revenue_mix(data, fy_key): sls = data["service_lines"] if not sls: return None labels = [sl["name"] for sl in sls if sl.get(fy_key, 0) > 0] values = [sl[fy_key] / 1000 for sl in sls if sl.get(fy_key, 0) > 0] if not values: return None fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.45, textinfo="percent", textfont=dict(color="white", size=12), marker=dict(colors=CHART_COLORS[:len(labels)]))]) fig.update_layout(**plotly_layout(f"Revenue Mix — {fy_key}", height=320)) return fig def chart_cost_structure(data, fy_key): annual = data["annual"].get(fy_key, {}) labels = ["Employee Comp", "Rent & Facilities", "Other Direct"] values = [abs(annual.get("emp_comp", 0)) / 1000, abs(annual.get("rent", 0)) / 1000, abs(annual.get("other_direct", 0)) / 1000] if sum(values) == 0: return None fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.45, textinfo="percent+label", textfont=dict(color="white", size=10), marker=dict(colors=[COLORS["warning"], COLORS["negative"], COLORS["text_dim"]]))]) fig.update_layout(**plotly_layout(f"Direct Cost Breakdown — {fy_key}", height=320)) return fig def chart_budget_vs_py(data): months = data["month_labels"] fy_list = sorted(data["monthly_revenue"].keys()) if len(fy_list) < 2: return None fig = go.Figure() bar_colors = [COLORS["accent"], COLORS["accent_alt"], COLORS["positive"]] for i, fy in enumerate(fy_list[-3:]): vals = data["monthly_revenue"].get(fy, []) fig.add_trace(go.Bar(x=months, y=[v / 1000 for v in vals], name=fy, marker_color=bar_colors[i % 3])) fig.update_layout(**plotly_layout("Monthly Revenue — Budget vs Prior Year")) fig.update_layout(barmode="group") fig.update_yaxes(title_text="Revenue ($K)") return fig def chart_pl_bridge(data): fy_list = sorted(data["annual"].keys())[-3:] categories = ["Revenue", "Gross Margin", "Contribution Margin"] fig = go.Figure() bar_colors = [COLORS["accent"], COLORS["accent_alt"], COLORS["positive"]] for i, fy in enumerate(fy_list): annual = data["annual"][fy] vals = [annual.get("total_revenue", 0) / 1000, annual.get("total_gm", 0) / 1000, annual.get("cm", 0) / 1000] fig.add_trace(go.Bar(x=categories, y=vals, name=fy, marker_color=bar_colors[i % 3])) fig.update_layout(**plotly_layout("P&L Bridge ($K)")) fig.update_layout(barmode="group") return fig def chart_cost_efficiency(data): fy_list = sorted(data["annual"].keys()) categories = ["COS %", "Direct Costs %", "Total Costs %"] fig = go.Figure() bar_colors = [COLORS["accent"], COLORS["accent_alt"], COLORS["positive"], COLORS["text_dim"], COLORS["warning"]] for i, fy in enumerate(fy_list): a = data["annual"][fy] rev = a.get("total_revenue", 1) or 1 vals = [a.get("total_cos", 0) / rev * 100, a.get("total_direct", 0) / rev * 100, (a.get("total_cos", 0) + a.get("total_direct", 0)) / rev * 100] fig.add_trace(go.Bar(x=categories, y=vals, name=fy, marker_color=bar_colors[i % len(bar_colors)])) fig.update_layout(**plotly_layout("Cost as % of Revenue")) fig.update_layout(barmode="group") fig.update_yaxes(ticksuffix="%") return fig def chart_area_revenue_comparison(area_datasets, fy_keys): fig = go.Figure() bar_colors = [COLORS["accent"], COLORS["accent_alt"], COLORS["positive"]] area_names = [ad["display_name"] for ad in area_datasets] for i, fy in enumerate(fy_keys[-3:]): vals = [ad["annual"].get(fy, {}).get("total_revenue", 0) / 1000 for ad in area_datasets] fig.add_trace(go.Bar(x=area_names, y=vals, name=fy, marker_color=bar_colors[i % 3], text=[f"${v:,.0f}" for v in vals], textposition="auto", textfont=dict(size=9, color="white"))) fig.update_layout(**plotly_layout("Revenue by Area ($K)", height=400)) fig.update_layout(barmode="group") fig.update_yaxes(title_text="Revenue ($K)") return fig def chart_area_cm_comparison(area_datasets, fy_keys): fig = go.Figure() bar_colors = [COLORS["accent"], COLORS["accent_alt"], COLORS["positive"]] area_names = [ad["display_name"] for ad in area_datasets] for i, fy in enumerate(fy_keys[-3:]): vals = [ad["annual"].get(fy, {}).get("cm_pct", 0) * 100 for ad in area_datasets] fig.add_trace(go.Bar(x=area_names, y=vals, name=fy, marker_color=bar_colors[i % 3], text=[f"{v:.1f}%" for v in vals], textposition="auto", textfont=dict(size=9, color="white"))) fig.update_layout(**plotly_layout("Contribution Margin % by Area", height=400)) fig.update_layout(barmode="group") fig.update_yaxes(title_text="CM %", ticksuffix="%") return fig def chart_area_share_of_revenue(area_datasets, fy_key): labels = [] values = [] for ad in area_datasets: rev = ad["annual"].get(fy_key, {}).get("total_revenue", 0) if rev > 0: labels.append(ad["display_name"]) values.append(rev / 1000) if not values: return None fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.45, textinfo="percent+label", textfont=dict(color="white", size=10), marker=dict(colors=AREA_COLORS[:len(labels)]))]) fig.update_layout(**plotly_layout(f"Revenue Share by Area — {fy_key}", height=350)) return fig def chart_area_gm_trend(area_datasets, fy_keys): fig = go.Figure() for i, ad in enumerate(area_datasets): vals = [ad["annual"].get(fy, {}).get("gm_pct", 0) * 100 for fy in fy_keys] fig.add_trace(go.Scatter(x=fy_keys, y=vals, name=ad["display_name"], line=dict(color=AREA_COLORS[i % len(AREA_COLORS)], width=2), mode="lines+markers", marker=dict(size=6))) fig.update_layout(**plotly_layout("Gross Margin % by Area — Annual Trend", height=380)) fig.update_yaxes(title_text="GM %", ticksuffix="%") return fig def chart_area_revenue_growth(area_datasets, fy_keys): if len(fy_keys) < 2: return None latest = fy_keys[-1] prior = fy_keys[-2] area_names = [] growth_vals = [] colors = [] for ad in area_datasets: rev_latest = ad["annual"].get(latest, {}).get("total_revenue", 0) rev_prior = ad["annual"].get(prior, {}).get("total_revenue", 1) or 1 growth = (rev_latest / rev_prior - 1) * 100 area_names.append(ad["display_name"]) growth_vals.append(growth) colors.append(COLORS["positive"] if growth > 0 else COLORS["negative"]) fig = go.Figure(data=[go.Bar(x=area_names, y=growth_vals, marker_color=colors, text=[f"{v:+.1f}%" for v in growth_vals], textposition="auto", textfont=dict(color="white", size=11))]) fig.update_layout(**plotly_layout(f"Revenue Growth by Area — {prior} → {latest}", height=380)) fig.update_yaxes(title_text="YoY Growth %", ticksuffix="%") return fig
-def compute_scenario(data, fy_key, rev_adj, cos_adj): a = data["annual"].get(fy_key, {}) rev = a.get("total_revenue", 0) cos = a.get("total_cos", 0) direct = a.get("total_direct", 0) adj_rev = rev * (1 + rev_adj) cos_pct = (cos / rev) if rev else 0 adj_cos = adj_rev * (cos_pct + cos_adj) adj_gm = adj_rev - adj_cos adj_cm = adj_gm - direct adj_cm_pct = adj_cm / adj_rev if adj_rev else 0 return {"revenue": adj_rev / 1000, "gm": adj_gm / 1000, "cm": adj_cm / 1000, "cm_pct": adj_cm_pct} def build_sensitivity_matrix(data, fy_key, rev_steps, cos_steps): matrix = [] for rev_adj in rev_steps: row = [] for cos_adj in cos_steps: result = compute_scenario(data, fy_key, rev_adj, cos_adj) row.append(result["cm_pct"]) matrix.append(row) return matrix def generate_excel_dashboard(data, area_datasets, original_wb_bytes): wb = openpyxl.load_workbook(io.BytesIO(original_wb_bytes)) if "Dashboard" in wb.sheetnames: del wb["Dashboard"] ws = wb.create_sheet("Dashboard", 0) fill_bg = PatternFill(start_color="1E1E2E", fill_type="solid") fill_header = PatternFill(start_color="353548", fill_type="solid") fill_odd = PatternFill(start_color="2A2A3C", fill_type="solid") fill_even = PatternFill(start_color="323245", fill_type="solid") fill_kpi = PatternFill(start_color="2A2A3E", fill_type="solid") font_title = Font(name="Segoe UI", size=16, bold=True, color="4FC3F7") font_section = Font(name="Segoe UI", size=12, bold=True, color="4FC3F7") font_header = Font(name="Segoe UI", size=9, bold=True, color="4FC3F7") font_data = Font(name="Segoe UI", size=10, color="FFFFFF") font_dim = Font(name="Segoe UI", size=9, color="78909C") font_kpi_val = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF") font_bold = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF") font_positive = Font(name="Segoe UI", size=10, bold=True, color="66BB6A") font_negative = Font(name="Segoe UI", size=10, color="EF5350") border_accent = Border(top=Side(style="medium", color="4FC3F7")) align_center = Alignment(horizontal="center", vertical="center") align_right = Alignment(horizontal="right", vertical="center") ws.column_dimensions["A"].width = 3 ws.column_dimensions["B"].width = 28 for col in "CDEFGH": ws.column_dimensions[col].width = 16 for row in range(1, 120): for col in range(1, 9): ws.cell(row=row, column=col).fill = fill_bg fy_list = sorted(data["annual"].keys()) latest_fy = fy_list[-1] if fy_list else "FY2026" prior_fy = fy_list[-2] if len(fy_list) >= 2 else fy_list[0] latest = data["annual"].get(latest_fy, {}) prior = data["annual"].get(prior_fy, {}) ws["B2"] = "CFO EXECUTIVE DASHBOARD" ws["B2"].font = font_title ws["B3"] = "($ in thousands)" ws["B3"].font = font_dim kpi_data = [ ("Total Revenue", latest.get("total_revenue", 0) / 1000, f"PY: ${prior.get('total_revenue', 0) / 1000:,.0f}", "$#,##0"), ("Rev Growth YoY", (latest.get("total_revenue", 0) / max(prior.get("total_revenue", 1), 1) - 1), f"PY GM%: {prior.get('gm_pct', 0) * 100:.1f}%", "0.0%"), ("Gross Margin %", latest.get("gm_pct", 0), f"PY: {prior.get('gm_pct', 0) * 100:.1f}%", "0.0%"), ("Contribution Margin", latest.get("cm", 0) / 1000, f"PY: ${prior.get('cm', 0) / 1000:,.0f}", "$#,##0"), ("CM %", latest.get("cm_pct", 0), f"PY: {prior.get('cm_pct', 0) * 100:.1f}%", "0.0%"), ] for i, (label, value, sub, fmt) in enumerate(kpi_data): col = i + 3 ws.cell(row=4, column=col, value=label).font = font_dim ws.cell(row=4, column=col).fill = fill_kpi ws.cell(row=4, column=col).alignment = align_center c = ws.cell(row=5, column=col, value=value) c.font = font_kpi_val; c.fill = fill_kpi; c.alignment = align_center; c.number_format = fmt ws.cell(row=6, column=col, value=sub).font = font_dim ws.cell(row=6, column=col).fill = fill_kpi ws.cell(row=6, column=col).alignment = align_center ws.cell(row=7, column=col).fill = fill_kpi ws.cell(row=10, column=2, value="ANNUAL FINANCIAL SUMMARY").font = font_section ws.cell(row=12, column=2, value="($K)").font = font_header ws.cell(row=12, column=2).fill = fill_header for i, fy in enumerate(fy_list[-5:]): c = ws.cell(row=12, column=3 + i, value=fy) c.font = font_header; c.fill = fill_header; c.alignment = align_center metrics = [ ("Total Revenue", "total_revenue", "$#,##0", True), ("Cost of Services", "total_cos", "$#,##0", False), ("Gross Margin", "total_gm", "$#,##0", True), ("GM %", "gm_pct", "0.0%", False), ("Direct Costs", "total_direct", "$#,##0", False), ("Contribution Margin", "cm", "$#,##0", True), ("CM %", "cm_pct", "0.0%", False), ("Operating Income", "oi", "$#,##0", True), ] for j, (label, key, fmt, is_sub) in enumerate(metrics): row = 13 + j fill = fill_odd if j % 2 == 0 else fill_even ws.cell(row=row, column=2, value=label).font = font_bold if is_sub else font_data ws.cell(row=row, column=2).fill = fill if is_sub: ws.cell(row=row, column=2).border = border_accent for i, fy in enumerate(fy_list[-5:]): a = data["annual"].get(fy, {}) val = a.get(key, 0) if "pct" not in key: val = val / 1000 c = ws.cell(row=row, column=3 + i, value=val) c.font = font_bold if is_sub else font_data c.fill = fill; c.number_format = fmt; c.alignment = align_right if is_sub: c.border = border_accent if area_datasets: area_start = 23 ws.cell(row=area_start, column=2, value="AREA PERFORMANCE").font = font_section hdr_row = area_start + 2 area_headers = ["Area", f"Rev {prior_fy} ($K)", f"Rev {latest_fy} ($K)", "Growth %", f"GM% {latest_fy}", f"CM% {latest_fy}", "Rev CAGR"] for i, h in enumerate(area_headers): c = ws.cell(row=hdr_row, column=2 + i, value=h) c.font = font_header; c.fill = fill_header; c.alignment = align_center for j, ad in enumerate(area_datasets): row = hdr_row + 1 + j fill = fill_odd if j % 2 == 0 else fill_even a_prior = ad["annual"].get(prior_fy, {}) a_latest = ad["annual"].get(latest_fy, {}) rev_p = a_prior.get("total_revenue", 0) / 1000 rev_l = a_latest.get("total_revenue", 0) / 1000 growth = (rev_l / rev_p - 1) if rev_p else 0 first_fy = sorted(ad["annual"].keys())[0] if ad["annual"] else prior_fy rev_first = ad["annual"].get(first_fy, {}).get("total_revenue", 0) / 1000 n_years = max(1, int(latest_fy[2:]) - int(first_fy[2:])) cagr = (rev_l / rev_first) ** (1 / n_years) - 1 if rev_first > 0 else 0 vals = [ (ad["display_name"], None, font_data), (rev_p, "$#,##0", font_data), (rev_l, "$#,##0", font_data), (growth, "0.0%", font_positive if growth > 0 else font_negative), (a_latest.get("gm_pct", 0), "0.0%", font_data), (a_latest.get("cm_pct", 0), "0.0%", font_data), (cagr, "0.0%", font_positive if cagr > 0.15 else font_data), ] for k, (val, fmt, font) in enumerate(vals): c = ws.cell(row=row, column=2 + k, value=val) c.font = font; c.fill = fill if fmt: c.number_format = fmt c.alignment = align_right if k > 0 else Alignment(vertical="center") output = io.BytesIO() wb.save(output) output.seek(0) return output.getvalue()
-def render_kpi_card(label, value, sub_text, border_color): return f""" <div class="kpi-card" style="border-top: 3px solid {border_color};"> <div class="kpi-label">{label}</div> <div class="kpi-value">{value}</div> <div class="kpi-sub">{sub_text}</div> </div> """ def render_area_card(area_name, revenue_k, cm_pct, growth_pct, color): growth_color = COLORS["positive"] if growth_pct >= 0 else COLORS["negative"] return f""" <div class="area-card" style="border-left-color: {color};"> <div class="area-name">{area_name}</div> <div class="area-metric">${revenue_k:,.0f}K</div> <div class="area-sub"> CM: {cm_pct:.1f}% &nbsp;|&nbsp; <span style="color:{growth_color}">Growth: {growth_pct:+.1f}%</span> </div> </div> """ def main(): if not st.session_state.get("authenticated", False): render_login_page() return inject_css() username = st.session_state["username"] user_name = st.session_state["user_name"] role = st.session_state["role"] perms = get_user_permissions(username) with st.sidebar: st.markdown(f'<div class="user-badge">👤 {user_name} <span style="color:{COLORS["accent"]};">({role})</span></div>', unsafe_allow_html=True) if st.button("🚪 Sign Out", use_container_width=True): for key in ["authenticated", "username", "user_name", "role", "login_time"]: st.session_state.pop(key, None) st.rerun() st.markdown("---") st.markdown(f"### 📊 CFO Dashboard") uploaded_file = st.file_uploader("Upload P&L Workbook (.xlsx)", type=["xlsx"]) if uploaded_file: st.success(f"✅ {uploaded_file.name}") st.markdown("---") st.markdown(f'<p style="color:{COLORS["text_dim"]}; font-size:11px;">Session: {role} access<br>Tabs: {sum(1 for v in perms.values() if v and v != perms.get("manage_users"))} available</p>', unsafe_allow_html=True) if not uploaded_file: st.markdown(f""" <div style="text-align:center; padding:80px 20px;"> <h1 style="color:{COLORS["accent"]}; font-size:36px;">📊 CFO Executive Dashboard</h1> <p style="color:{COLORS["text_muted"]}; font-size:16px; max-width:600px; margin:20px auto;">Welcome, {user_name}. Upload a P&L workbook to generate your executive dashboard.</p> <p style="color:{COLORS["text_dim"]}; font-size:13px;">← Upload a .xlsx file in the sidebar to get started</p> </div> """, unsafe_allow_html=True) return file_bytes = uploaded_file.read() file_hash = hashlib.md5(file_bytes).hexdigest() wb_temp = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True) sheet_names = wb_temp.sheetnames wb_temp.close() with st.sidebar: default_idx = 0 for i, name in enumerate(sheet_names): if "consolidated" in name.lower() and "p&l" in name.lower(): default_idx = i break elif "consolidated" in name.lower(): default_idx = i selected_sheet = st.selectbox("Select Consolidated P&L Sheet", sheet_names, index=default_idx) df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=selected_sheet, header=None) structure = discover_pl_structure(df) data = extract_pl_data(df, structure) fy_list = data["fy_labels"] if not fy_list: st.error("❌ Could not detect fiscal year columns. Please check your P&L format.") return latest_fy = fy_list[-1] prior_fy = fy_list[-2] if len(fy_list) >= 2 else fy_list[0] latest = data["annual"].get(latest_fy, {}) prior = data["annual"].get(prior_fy, {}) area_sheet_names = discover_area_sheets(sheet_names, selected_sheet) area_datasets = [] for area_name in area_sheet_names: try: ad = extract_area_data(file_bytes, area_name, structure) if ad["annual"]: area_datasets.append(ad) except Exception: pass area_datasets.sort(key=lambda x: x["annual"].get(latest_fy, {}).get("total_revenue", 0), reverse=True) with st.sidebar: st.markdown("---") st.markdown(f"**📋 Discovered Structure**") st.markdown(f'<p style="color:{COLORS["text_dim"]}; font-size:11px;">Fiscal Years: {", ".join(fy_list)}<br>Service Lines: {len(data["service_lines"])}<br>Monthly Data: {len(data["monthly_revenue"])} FYs<br>Areas Found: {len(area_datasets)}</p>', unsafe_allow_html=True) tab_names = [] tab_keys = [] if perms["dashboard"]: tab_names.append("📊 Dashboard"); tab_keys.append("dashboard") if perms["trends"]: tab_names.append("📈 Trends"); tab_keys.append("trends") if perms["areas"] and area_datasets: tab_names.append("🗺️ Areas"); tab_keys.append("areas") if perms["scenarios"]: tab_names.append("🎯 Scenarios"); tab_keys.append("scenarios") if perms["export"]: tab_names.append("⬇️ Export"); tab_keys.append("export") tabs = st.tabs(tab_names) tab_map = dict(zip(tab_keys, tabs))
-if "dashboard" in tab_map: with tab_map["dashboard"]: rev = latest.get("total_revenue", 0) prior_rev = prior.get("total_revenue", 1) or 1 growth = rev / prior_rev - 1 gm_pct = latest.get("gm_pct", 0) cm = latest.get("cm", 0) cm_pct = latest.get("cm_pct", 0) cols = st.columns(5) kpis = [ ("Total Revenue", f"${rev / 1000:,.0f}K", f"PY: ${prior_rev / 1000:,.0f}K", COLORS["accent"]), ("Rev Growth YoY", f"{growth * 100:.1f}%", f"PY GM%: {prior.get('gm_pct', 0) * 100:.1f}%", COLORS["positive"]), ("Gross Margin %", f"{gm_pct * 100:.1f}%", f"PY: {prior.get('gm_pct', 0) * 100:.1f}%", COLORS["warning"]), ("Contribution Margin", f"${cm / 1000:,.0f}K", f"PY: ${prior.get('cm', 0) / 1000:,.0f}K", COLORS["accent_alt"]), ("CM %", f"{cm_pct * 100:.1f}%", f"PY: {prior.get('cm_pct', 0) * 100:.1f}%", COLORS["negative"]), ] for col, (label, value, sub, bc) in zip(cols, kpis): with col: st.markdown(render_kpi_card(label, value, sub, bc), unsafe_allow_html=True) st.markdown("") if data["service_lines"]: st.markdown(f'<div class="section-title">SERVICE LINE PERFORMANCE — {latest_fy} vs {prior_fy}</div>', unsafe_allow_html=True) sl_df = pd.DataFrame(data["service_lines"]) if prior_fy in sl_df.columns and latest_fy in sl_df.columns: display_df = sl_df[["name", prior_fy, latest_fy]].copy() display_df.columns = ["Service Line", f"{prior_fy} ($K)", f"{latest_fy} Bgt ($K)"] display_df[f"{prior_fy} ($K)"] /= 1000 display_df[f"{latest_fy} Bgt ($K)"] /= 1000 display_df["Variance $"] = display_df[f"{latest_fy} Bgt ($K)"] - display_df[f"{prior_fy} ($K)"] display_df["Variance %"] = (display_df["Variance $"] / display_df[f"{prior_fy} ($K)"]).apply(lambda x: f"{x * 100:.1f}%") st.dataframe(display_df, use_container_width=True, hide_index=True) st.markdown(f'<div class="section-title">REVENUE MIX</div>', unsafe_allow_html=True) c1, c2 = st.columns(2) with c1: fig = chart_revenue_mix(data, prior_fy) if fig: st.plotly_chart(fig, use_container_width=True) with c2: fig = chart_revenue_mix(data, latest_fy) if fig: st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">ANNUAL FINANCIAL SUMMARY</div>', unsafe_allow_html=True) summary_rows = [] for label, key, _ in [("Total Revenue", "total_revenue", False), ("Cost of Services", "total_cos", False), ("Gross Margin", "total_gm", True), ("GM %", "gm_pct", False), ("Direct Costs", "total_direct", False), ("Contribution Margin", "cm", True), ("CM %", "cm_pct", False), ("Operating Income", "oi", True)]: row = {"Metric": label} for fy in fy_list: a = data["annual"].get(fy, {}) val = a.get(key, 0) row[fy] = f"{val * 100:.1f}%" if "pct" in key else f"${val / 1000:,.0f}" summary_rows.append(row) st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True) st.markdown(f'<div class="section-title">COST STRUCTURE</div>', unsafe_allow_html=True) c1, c2 = st.columns(2) with c1: fig = chart_cost_structure(data, prior_fy) if fig: st.plotly_chart(fig, use_container_width=True) with c2: fig = chart_cost_structure(data, latest_fy) if fig: st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">P&L BRIDGE</div>', unsafe_allow_html=True) c1, c2 = st.columns(2) with c1: fig = chart_pl_bridge(data) if fig: st.plotly_chart(fig, use_container_width=True) with c2: fig = chart_cost_efficiency(data) if fig: st.plotly_chart(fig, use_container_width=True) if "trends" in tab_map: with tab_map["trends"]: st.markdown(f'<div class="section-title">MONTHLY REVENUE TREND</div>', unsafe_allow_html=True) st.plotly_chart(chart_revenue_trend(data), use_container_width=True) c1, c2 = st.columns(2) with c1: st.markdown(f'<div class="section-title">GROSS MARGIN % TREND</div>', unsafe_allow_html=True) st.plotly_chart(chart_gm_trend(data), use_container_width=True) with c2: st.markdown(f'<div class="section-title">CONTRIBUTION MARGIN % TREND</div>', unsafe_allow_html=True) st.plotly_chart(chart_cm_trend(data), use_container_width=True) st.markdown(f'<div class="section-title">BUDGET vs PRIOR YEAR — MONTHLY</div>', unsafe_allow_html=True) fig = chart_budget_vs_py(data) if fig: st.plotly_chart(fig, use_container_width=True) if "areas" in tab_map: with tab_map["areas"]: st.markdown(f'<div class="section-title">AREA PERFORMANCE OVERVIEW — {len(area_datasets)} Areas</div>', unsafe_allow_html=True) n_areas = len(area_datasets) cols_per_row = min(n_areas, 4) for row_start in range(0, n_areas, cols_per_row): cols = st.columns(cols_per_row) for i, col in enumerate(cols): idx = row_start + i if idx >= n_areas: break ad = area_datasets[idx] a_latest = ad["annual"].get(latest_fy, {}) a_prior = ad["annual"].get(prior_fy, {}) rev_l = a_latest.get("total_revenue", 0) / 1000 growth = (a_latest.get("total_revenue", 0) / (a_prior.get("total_revenue", 1) or 1) - 1) * 100 cm_pct_area = a_latest.get("cm_pct", 0) * 100 with col: st.markdown(render_area_card(ad["display_name"], rev_l, cm_pct_area, growth, AREA_COLORS[idx % len(AREA_COLORS)]), unsafe_allow_html=True) st.markdown("") st.markdown(f'<div class="section-title">REVENUE BY AREA</div>', unsafe_allow_html=True) c1, c2 = st.columns(2) with c1: fig = chart_area_revenue_comparison(area_datasets, fy_list) st.plotly_chart(fig, use_container_width=True) with c2: fig = chart_area_share_of_revenue(area_datasets, latest_fy) if fig: st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">MARGIN ANALYSIS BY AREA</div>', unsafe_allow_html=True) c1, c2 = st.columns(2) with c1: fig = chart_area_cm_comparison(area_datasets, fy_list) st.plotly_chart(fig, use_container_width=True) with c2: fig = chart_area_gm_trend(area_datasets, fy_list) st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">REVENUE GROWTH BY AREA — {prior_fy} → {latest_fy}</div>', unsafe_allow_html=True) fig = chart_area_revenue_growth(area_datasets, fy_list) if fig: st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">AREA PERFORMANCE TABLE</div>', unsafe_allow_html=True) area_rows = [] for ad in area_datasets: a_prior = ad["annual"].get(prior_fy, {}) a_latest = ad["annual"].get(latest_fy, {}) rev_p = a_prior.get("total_revenue", 0) / 1000 rev_l = a_latest.get("total_revenue", 0) / 1000 growth = (rev_l / rev_p - 1) * 100 if rev_p else 0 first_fy = sorted(ad["annual"].keys())[0] rev_first = ad["annual"].get(first_fy, {}).get("total_revenue", 0) / 1000 n_years = max(1, int(latest_fy[2:]) - int(first_fy[2:])) cagr = ((rev_l / rev_first) ** (1 / n_years) - 1) * 100 if rev_first > 0 else 0 area_rows.append({"Area": ad["display_name"], f"Rev {prior_fy} ($K)": f"${rev_p:,.0f}", f"Rev {latest_fy} ($K)": f"${rev_l:,.0f}", "Growth %": f"{growth:+.1f}%", f"GM% {latest_fy}": f"{a_latest.get('gm_pct', 0) * 100:.1f}%", f"CM% {latest_fy}": f"{a_latest.get('cm_pct', 0) * 100:.1f}%", "Rev CAGR": f"{cagr:.1f}%"}) st.dataframe(pd.DataFrame(area_rows), use_container_width=True, hide_index=True) st.markdown(f'<div class="section-title">AREA DRILLDOWN</div>', unsafe_allow_html=True) area_names_list = [ad["display_name"] for ad in area_datasets] selected_area = st.selectbox("Select an area to drill into:", area_names_list) if selected_area: sel_data = next(ad for ad in area_datasets if ad["display_name"] == selected_area) a_l = sel_data["annual"].get(latest_fy, {}) area_cols = st.columns(4) area_kpis = [ ("Revenue", f"${a_l.get('total_revenue', 0) / 1000:,.0f}K", COLORS["accent"]), ("Gross Margin %", f"{a_l.get('gm_pct', 0) * 100:.1f}%", COLORS["warning"]), ("CM %", f"{a_l.get('cm_pct', 0) * 100:.1f}%", COLORS["positive"]), ("CM ($K)", f"${a_l.get('cm', 0) / 1000:,.0f}K", COLORS["accent_alt"]), ] for col, (lbl, val, bc) in zip(area_cols, area_kpis): with col: st.markdown(f'<div class="kpi-card" style="border-top: 3px solid {bc}; min-height:80px;"><div class="kpi-label">{lbl}</div><div class="kpi-value" style="font-size:22px;">{val}</div></div>', unsafe_allow_html=True) st.markdown("") area_summary = [] for label, key in [("Total Revenue", "total_revenue"), ("Cost of Services", "total_cos"), ("Gross Margin", "total_gm"), ("GM %", "gm_pct"), ("Contribution Margin", "cm"), ("CM %", "cm_pct")]: row = {"Metric": label} for fy in fy_list: a = sel_data["annual"].get(fy, {}) val = a.get(key, 0) row[fy] = f"{val * 100:.1f}%" if "pct" in key else f"${val / 1000:,.0f}" area_summary.append(row) st.dataframe(pd.DataFrame(area_summary), use_container_width=True, hide_index=True) if sel_data.get("monthly_revenue"): c1, c2 = st.columns(2) with c1: fig = chart_revenue_trend(sel_data) fig.update_layout(title=dict(text=f"{selected_area} — Monthly Revenue ($K)")) st.plotly_chart(fig, use_container_width=True) with c2: if sel_data.get("monthly_gm_pct"): fig = chart_gm_trend(sel_data) fig.update_layout(title=dict(text=f"{selected_area} — GM% Trend")) st.plotly_chart(fig, use_container_width=True)
-if "scenarios" in tab_map: with tab_map["scenarios"]: st.markdown(f'<div class="section-title">SCENARIO ANALYSIS — {latest_fy}</div>', unsafe_allow_html=True) c1, c2, c3 = st.columns(3) with c1: st.markdown("**▲ Bull Case**") bull_rev = st.slider("Revenue Growth Adj (Bull)", -20.0, 30.0, 5.0, 0.5, key="bull_rev") / 100 bull_cos = st.slider("COS % Adj (Bull)", -10.0, 10.0, -2.0, 0.5, key="bull_cos") / 100 with c2: st.markdown("**● Base Case (Budget)**") st.info(f"Revenue: ${latest.get('total_revenue', 0) / 1000:,.0f}K\n\nCM%: {latest.get('cm_pct', 0) * 100:.1f}%") with c3: st.markdown("**▼ Bear Case**") bear_rev = st.slider("Revenue Growth Adj (Bear)", -30.0, 10.0, -10.0, 0.5, key="bear_rev") / 100 bear_cos = st.slider("COS % Adj (Bear)", -5.0, 15.0, 3.0, 0.5, key="bear_cos") / 100 bull = compute_scenario(data, latest_fy, bull_rev, bull_cos) base = compute_scenario(data, latest_fy, 0, 0) bear = compute_scenario(data, latest_fy, bear_rev, bear_cos) scenario_df = pd.DataFrame([ {"Scenario": "▲ Bull", "Revenue ($K)": f"${bull['revenue']:,.0f}", "GM ($K)": f"${bull['gm']:,.0f}", "CM ($K)": f"${bull['cm']:,.0f}", "CM %": f"{bull['cm_pct'] * 100:.1f}%"}, {"Scenario": "● Base", "Revenue ($K)": f"${base['revenue']:,.0f}", "GM ($K)": f"${base['gm']:,.0f}", "CM ($K)": f"${base['cm']:,.0f}", "CM %": f"{base['cm_pct'] * 100:.1f}%"}, {"Scenario": "▼ Bear", "Revenue ($K)": f"${bear['revenue']:,.0f}", "GM ($K)": f"${bear['gm']:,.0f}", "CM ($K)": f"${bear['cm']:,.0f}", "CM %": f"{bear['cm_pct'] * 100:.1f}%"}, ]) st.dataframe(scenario_df, use_container_width=True, hide_index=True) fig = go.Figure() for scen, color, label in [(bull, COLORS["positive"], "Bull"), (base, COLORS["accent_alt"], "Base"), (bear, COLORS["negative"], "Bear")]: fig.add_trace(go.Bar(x=["Revenue", "Gross Margin", "Contribution Margin"], y=[scen["revenue"], scen["gm"], scen["cm"]], name=label, marker_color=color)) fig.update_layout(**plotly_layout("Scenario Comparison ($K)")) fig.update_layout(barmode="group") st.plotly_chart(fig, use_container_width=True) st.markdown(f'<div class="section-title">CM % SENSITIVITY — Revenue Growth vs COS Adjustment</div>', unsafe_allow_html=True) rev_steps = [-0.10, -0.05, 0, 0.05, 0.10] cos_steps = [-0.03, -0.01, 0, 0.02, 0.05] matrix = build_sensitivity_matrix(data, latest_fy, rev_steps, cos_steps) fig = go.Figure(data=go.Heatmap( z=[[v * 100 for v in row] for row in matrix], x=[f"{c * 100:+.0f}% COS" for c in cos_steps], y=[f"{r * 100:+.0f}% Rev" for r in rev_steps], colorscale=[[0, COLORS["negative"]], [0.4, COLORS["warning"]], [0.6, COLORS["accent_alt"]], [1, COLORS["positive"]]], text=[[f"{v * 100:.1f}%" for v in row] for row in matrix], texttemplate="%{text}", textfont=dict(size=12, color="white"), hovertemplate="Rev Adj: %{y}<br>COS Adj: %{x}<br>CM%%: %{text}<extra></extra>", )) fig.update_layout(**plotly_layout("", height=380)) fig.update_layout(xaxis=dict(title="COS % Adjustment", side="top"), yaxis=dict(title="Revenue Growth Adjustment", autorange="reversed")) st.plotly_chart(fig, use_container_width=True) if "export" in tab_map: with tab_map["export"]: st.markdown(f'<div class="section-title">DOWNLOAD EXCEL DASHBOARD</div>', unsafe_allow_html=True) st.markdown(f'<p style="color:{COLORS["text_muted"]}">Download your original workbook with a new <strong>Dashboard</strong> sheet prepended, including KPI scorecards, annual financial summary, and area performance table.</p>', unsafe_allow_html=True) if st.button("🔧 Generate Excel Dashboard", type="primary"): with st.spinner("Building Excel dashboard..."): excel_bytes = generate_excel_dashboard(data, area_datasets, file_bytes) st.download_button(label="⬇️ Download Dashboard Workbook", data=excel_bytes, file_name=f"CFO_Dashboard_{uploaded_file.name}", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") st.success("✅ Dashboard generated! Click above to download.") st.markdown("---") st.markdown(f'<p style="color:{COLORS["text_dim"]}; font-size:11px;">Export includes: KPI scorecards, annual financial summary, and area performance.<br>For fully formula-driven Excel dashboards with 16 charts, use the Claude Excel add-in.</p>', unsafe_allow_html=True) if __name__ == "__main__": main()
+"""
+Executive Dashboard — Streamlit Web App
+Upload a multi-entity P&L workbook → view an interactive dark-theme dashboard
+→ area-by-area breakdowns → scenario analysis → download the completed Excel file.
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import io
+import re
+
+st.set_page_config(
+    page_title="Executive Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Design system (matches skill exactly) ────────────────────────────────────
+COLORS = {
+    "bg_primary":   "#1E1E2E",
+    "bg_header":    "#353548",
+    "bg_odd":       "#2A2A3C",
+    "bg_even":      "#323245",
+    "bg_kpi":       "#2A2A3E",
+    "text_primary": "#FFFFFF",
+    "text_secondary":"#E0E0E0",
+    "text_muted":   "#B0B0B0",
+    "text_dim":     "#78909C",
+    "accent":       "#4FC3F7",
+    "accent_alt":   "#42A5F5",
+    "positive":     "#66BB6A",
+    "negative":     "#EF5350",
+    "warning":      "#FFB74D",
+    "highlight":    "#FFD600",
+}
+CHART_COLORS = ["#78909C", "#90A4AE", "#4FC3F7", "#42A5F5", "#66BB6A", "#FF8A65"]
+AREA_COLORS  = ["#4FC3F7", "#66BB6A", "#FFB74D", "#EF5350", "#AB47BC",
+                 "#FF8A65", "#26C6DA", "#9CCC65"]
+
+
+# ── CSS injection ─────────────────────────────────────────────────────────────
+def inject_css():
+    st.markdown(f"""
+    <style>
+    .stApp {{ background-color: {COLORS["bg_primary"]}; }}
+    .main .block-container {{ padding-top: 1rem; max-width: 1400px; }}
+    h1, h2, h3 {{ color: {COLORS["accent"]} !important; }}
+    p, span, label, .stMarkdown {{ color: {COLORS["text_secondary"]} !important; }}
+    .kpi-card {{
+        background: {COLORS["bg_kpi"]}; border-radius: 8px;
+        padding: 16px 20px; text-align: center; min-height: 110px;
+    }}
+    .kpi-label {{
+        color: {COLORS["text_muted"]}; font-size: 12px; font-weight: 600;
+        text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;
+    }}
+    .kpi-value {{ font-size: 28px; font-weight: 700; color: {COLORS["text_primary"]}; line-height: 1.2; }}
+    .kpi-sub   {{ color: {COLORS["text_dim"]}; font-size: 11px; margin-top: 4px; }}
+    .section-title {{
+        color: {COLORS["accent"]} !important; font-size: 16px; font-weight: 700;
+        margin: 30px 0 12px 0; letter-spacing: 0.5px;
+    }}
+    .area-card {{
+        background: {COLORS["bg_odd"]}; border-radius: 8px;
+        padding: 14px 18px; min-height: 90px;
+        border-left: 4px solid {COLORS["accent"]};
+    }}
+    .area-name   {{ color: {COLORS["accent"]}; font-size: 13px; font-weight: 700; margin-bottom: 4px; }}
+    .area-metric {{ color: {COLORS["text_primary"]}; font-size: 20px; font-weight: 700; line-height: 1.3; }}
+    .area-sub    {{ color: {COLORS["text_dim"]}; font-size: 10px; }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: 8px; }}
+    .stTabs [data-baseweb="tab"] {{
+        background-color: {COLORS["bg_header"]}; color: {COLORS["text_muted"]};
+        border-radius: 6px 6px 0 0; padding: 8px 20px;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background-color: {COLORS["accent_alt"]} !important; color: white !important;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# ── P&L parsing ───────────────────────────────────────────────────────────────
+def find_row_by_label(df, keywords, col_idx=0):
+    for i, val in enumerate(df.iloc[:, col_idx]):
+        if pd.isna(val):
+            continue
+        val_str = str(val).strip().lower()
+        if any(kw.lower() in val_str for kw in keywords):
+            return i
+    return None
+
+def find_fy_columns(df):
+    fy_cols = {}
+    for row_idx in range(min(6, len(df))):
+        for col_idx in range(len(df.columns)):
+            val = df.iloc[row_idx, col_idx]
+            if pd.isna(val):
+                continue
+            val_str = str(val).strip()
+            match = re.search(r'(?:FY\s*)?(\d{4})\s*(?:Total|Budget|Bgt|Actual|Act)', val_str, re.IGNORECASE)
+            if match and "total" in val_str.lower():
+                fy_cols[f"FY{match.group(1)}"] = col_idx
+    return fy_cols
+
+def find_monthly_columns(fy_total_col):
+    if fy_total_col is None or fy_total_col < 12:
+        return []
+    return list(range(fy_total_col - 12, fy_total_col))
+
+def discover_and_extract(df):
+    rows = {
+        "total_revenue": find_row_by_label(df, ["total revenue", "total rev", "net revenue"]),
+        "total_cos":     find_row_by_label(df, ["total cost of services", "total cos", "cost of services", "total cogs", "cost of goods"]),
+        "total_gm":      find_row_by_label(df, ["total gross margin", "gross margin", "gross profit"]),
+        "gm_pct":        find_row_by_label(df, ["gross margin %", "gm %", "gm%", "gross margin percent"]),
+        "emp_comp":      find_row_by_label(df, ["employee compensation", "employee comp", "salaries", "payroll"]),
+        "rent":          find_row_by_label(df, ["rent & facilities", "rent", "facilities", "occupancy"]),
+        "other_direct":  find_row_by_label(df, ["other direct", "other operating"]),
+        "total_direct":  find_row_by_label(df, ["total direct costs", "total direct", "total operating expenses"]),
+        "cm":            find_row_by_label(df, ["contribution margin"]),
+        "cm_pct":        find_row_by_label(df, ["contribution margin %", "cm %", "cm%"]),
+        "oi":            find_row_by_label(df, ["operating income", "net income", "ebitda", "ebit"]),
+    }
+    fy_cols = find_fy_columns(df)
+    annual = {}
+    for fy, col in sorted(fy_cols.items()):
+        a = {}
+        for key, row_idx in rows.items():
+            if row_idx is not None and col < len(df.columns):
+                val = df.iloc[row_idx, col]
+                a[key] = float(val) if pd.notna(val) and isinstance(val, (int, float)) else 0
+            else:
+                a[key] = 0
+        annual[fy] = a
+
+    # Monthly data
+    monthly_rev, monthly_gm, monthly_cm = {}, {}, {}
+    for fy, col in sorted(fy_cols.items()):
+        mc = find_monthly_columns(col)
+        if not mc:
+            continue
+        for metric_key, row_key, target in [
+            ("monthly_revenue", "total_revenue", monthly_rev),
+            ("monthly_gm_pct",  "gm_pct",        monthly_gm),
+            ("monthly_cm_pct",  "cm_pct",         monthly_cm),
+        ]:
+            ri = rows.get(row_key)
+            if ri is not None:
+                vals = []
+                for c in mc:
+                    v = df.iloc[ri, c] if c < len(df.columns) else 0
+                    vals.append(float(v) if pd.notna(v) and isinstance(v, (int, float)) else 0)
+                target[fy] = vals
+
+    # Service lines
+    service_lines = []
+    if rows["total_revenue"] is not None:
+        for i in range(max(0, rows["total_revenue"] - 15), rows["total_revenue"]):
+            val = df.iloc[i, 0]
+            if pd.isna(val):
+                continue
+            name = str(val).strip()
+            if not name or "total" in name.lower():
+                continue
+            has_data = any(
+                pd.notna(df.iloc[i, c]) and isinstance(df.iloc[i, c], (int, float))
+                for c in range(1, min(len(df.columns), 20))
+            )
+            if not has_data:
+                continue
+            sl = {"name": name}
+            for fy, col in sorted(fy_cols.items()):
+                v = df.iloc[i, col] if col < len(df.columns) else 0
+                sl[fy] = float(v) if pd.notna(v) and isinstance(v, (int, float)) else 0
+            service_lines.append(sl)
+
+    return {
+        "annual": annual,
+        "monthly_revenue": monthly_rev,
+        "monthly_gm_pct":  monthly_gm,
+        "monthly_cm_pct":  monthly_cm,
+        "service_lines": service_lines,
+        "fy_labels": sorted(fy_cols.keys()),
+        "month_labels": ["Jul","Aug","Sep","Oct","Nov","Dec","Jan","Feb","Mar","Apr","May","Jun"],
+    }
+
+def discover_area_sheets(sheet_names, consolidated_name):
+    skip = ["consolidated","dashboard","fte","supervision","chart","template",
+            "summary","discontinued","new sites","_chartdata","assumption"]
+    areas = []
+    for name in sheet_names:
+        n = name.lower()
+        if n == consolidated_name.lower():
+            continue
+        if any(s in n for s in skip):
+            continue
+        if "p&l" in n or "p_l" in n or "pl" in n:
+            areas.append(name)
+    return areas
+
+
+# ── Chart helpers ─────────────────────────────────────────────────────────────
+def plotly_base(title="", height=350):
+    return dict(
+        title=dict(text=title, font=dict(color=COLORS["text_secondary"], size=13)),
+        paper_bgcolor=COLORS["bg_primary"],
+        plot_bgcolor=COLORS["bg_primary"],
+        font=dict(family="Segoe UI, sans-serif", color=COLORS["text_muted"], size=11),
+        legend=dict(font=dict(color=COLORS["text_muted"], size=10),
+                    orientation="h", yanchor="bottom", y=-0.28, xanchor="center", x=0.5),
+        margin=dict(l=50, r=20, t=45, b=60),
+        height=height,
+        xaxis=dict(gridcolor="#3A3A50", zerolinecolor="#3A3A50"),
+        yaxis=dict(gridcolor="#3A3A50", zerolinecolor="#3A3A50"),
+    )
+
+def fmt_dollars(v):
+    """Format value (raw, not /1000) as $#,##0 display."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    return f"${abs(v)/1000:,.0f}"
+
+def fmt_pct(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    p = v * 100 if abs(v) < 2 else v
+    return f"{p:.1f}%"
+
+def fmt_growth(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    p = v * 100 if abs(v) < 2 else v
+    sign = "+" if p >= 0 else ""
+    return f"{sign}{p:.1f}%"
+
+
+# ── KPI card HTML ─────────────────────────────────────────────────────────────
+def kpi_card(label, value, sub, border_color):
+    return f"""
+    <div class="kpi-card" style="border-top: 3px solid {border_color};">
+        <div class="kpi-label">{label}</div>
+        <div class="kpi-value">{value}</div>
+        <div class="kpi-sub">{sub}</div>
+    </div>"""
+
+def area_card(name, revenue, cm_pct, growth, color):
+    g_color = COLORS["positive"] if growth >= 0 else COLORS["negative"]
+    sign = "+" if growth >= 0 else ""
+    return f"""
+    <div class="area-card" style="border-left-color: {color};">
+        <div class="area-name">{name}</div>
+        <div class="area-metric">{fmt_dollars(revenue)}</div>
+        <div class="area-sub">
+            CM: {fmt_pct(cm_pct)} &nbsp;|&nbsp;
+            <span style="color:{g_color}">Growth: {sign}{growth:.1f}%</span>
+        </div>
+    </div>"""
+
+
+# ── Scenario math ─────────────────────────────────────────────────────────────
+def compute_scenario(annual_latest, rev_adj, cos_adj):
+    rev    = annual_latest.get("total_revenue", 0) * (1 + rev_adj)
+    cos_pct = (annual_latest.get("total_cos", 0) / max(annual_latest.get("total_revenue", 1), 1)) + cos_adj
+    cos    = rev * cos_pct
+    gm     = rev - cos
+    cm     = gm - annual_latest.get("total_direct", 0)
+    return {
+        "revenue": rev / 1000,
+        "gm":      gm / 1000,
+        "cm":      cm / 1000,
+        "cm_pct":  cm / rev if rev else 0,
+    }
+
+
+# ── Excel export ──────────────────────────────────────────────────────────────
+def generate_excel(data, area_datasets, original_bytes):
+    wb = openpyxl.load_workbook(io.BytesIO(original_bytes))
+    if "Dashboard" in wb.sheetnames:
+        del wb["Dashboard"]
+    ws = wb.create_sheet("Dashboard", 0)
+
+    fills = {
+        "bg":     PatternFill(start_color="1E1E2E", fill_type="solid"),
+        "header": PatternFill(start_color="353548", fill_type="solid"),
+        "odd":    PatternFill(start_color="2A2A3C", fill_type="solid"),
+        "even":   PatternFill(start_color="323245", fill_type="solid"),
+        "kpi":    PatternFill(start_color="2A2A3E", fill_type="solid"),
+    }
+    fonts = {
+        "title":    Font(name="Segoe UI", size=16, bold=True,  color="4FC3F7"),
+        "section":  Font(name="Segoe UI", size=12, bold=True,  color="4FC3F7"),
+        "header":   Font(name="Segoe UI", size=9,  bold=True,  color="4FC3F7"),
+        "data":     Font(name="Segoe UI", size=10, color="FFFFFF"),
+        "dim":      Font(name="Segoe UI", size=9,  color="78909C"),
+        "kpi_val":  Font(name="Segoe UI", size=14, bold=True,  color="FFFFFF"),
+        "bold":     Font(name="Segoe UI", size=10, bold=True,  color="FFFFFF"),
+        "positive": Font(name="Segoe UI", size=10, bold=True,  color="66BB6A"),
+        "negative": Font(name="Segoe UI", size=10, color="EF5350"),
+    }
+    border_accent = Border(top=Side(style="medium", color="4FC3F7"))
+    center = Alignment(horizontal="center", vertical="center")
+    right  = Alignment(horizontal="right",  vertical="center")
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 28
+    for col in "CDEFGH":
+        ws.column_dimensions[col].width = 16
+
+    for row in range(1, 130):
+        for col in range(1, 9):
+            ws.cell(row=row, column=col).fill = fills["bg"]
+
+    fy_list   = sorted(data["annual"].keys())
+    latest_fy = fy_list[-1] if fy_list else "FY2026"
+    prior_fy  = fy_list[-2] if len(fy_list) >= 2 else fy_list[0]
+    latest    = data["annual"].get(latest_fy, {})
+    prior     = data["annual"].get(prior_fy,  {})
+
+    # Title
+    ws["B2"] = "EXECUTIVE DASHBOARD"
+    ws["B2"].font = fonts["title"]
+    ws["B3"] = "($000s)"
+    ws["B3"].font = fonts["dim"]
+
+    # KPI row
+    kpi_items = [
+        ("Total Revenue",        latest.get("total_revenue",0)/1000, f"PY: {fmt_dollars(prior.get('total_revenue',0))}",  "$#,##0"),
+        ("Rev Growth YoY",       (latest.get("total_revenue",0)/max(prior.get("total_revenue",1),1))-1,
+                                 f"PY GM%: {fmt_pct(prior.get('gm_pct',0))}",                                             "0.0%"),
+        ("Gross Margin %",       latest.get("gm_pct",0),             f"PY: {fmt_pct(prior.get('gm_pct',0))}",             "0.0%"),
+        ("Contribution Margin",  latest.get("cm",0)/1000,            f"PY: {fmt_dollars(prior.get('cm',0))}",             "$#,##0"),
+        ("CM %",                 latest.get("cm_pct",0),             f"PY: {fmt_pct(prior.get('cm_pct',0))}",             "0.0%"),
+    ]
+    for i, (label, value, sub, fmt) in enumerate(kpi_items):
+        col = i + 3
+        lbl = ws.cell(row=4, column=col, value=label)
+        lbl.font = fonts["dim"]; lbl.fill = fills["kpi"]; lbl.alignment = center
+        val = ws.cell(row=5, column=col, value=value)
+        val.font = fonts["kpi_val"]; val.fill = fills["kpi"]
+        val.alignment = center; val.number_format = fmt
+        sub_cell = ws.cell(row=6, column=col, value=sub)
+        sub_cell.font = fonts["dim"]; sub_cell.fill = fills["kpi"]; sub_cell.alignment = center
+        ws.cell(row=7, column=col).fill = fills["kpi"]
+
+    # Annual financial summary
+    ws.cell(row=10, column=2, value="ANNUAL FINANCIAL SUMMARY").font = fonts["section"]
+    ws.cell(row=12, column=2, value=" ").font = fonts["header"]
+    ws.cell(row=12, column=2).fill = fills["header"]
+    for i, fy in enumerate(fy_list[-5:]):
+        c = ws.cell(row=12, column=3+i, value=fy)
+        c.font = fonts["header"]; c.fill = fills["header"]; c.alignment = center
+
+    metrics = [
+        ("Total Revenue",       "total_revenue", "$#,##0", False),
+        ("Cost of Services",    "total_cos",     "$#,##0", False),
+        ("Gross Margin",        "total_gm",      "$#,##0", True),
+        ("GM %",                "gm_pct",        "0.0%",   False),
+        ("Direct Costs",        "total_direct",  "$#,##0", False),
+        ("Contribution Margin", "cm",            "$#,##0", True),
+        ("CM %",                "cm_pct",        "0.0%",   False),
+        ("Operating Income",    "oi",            "$#,##0", True),
+    ]
+    for j, (label, key, fmt, is_sub) in enumerate(metrics):
+        row  = 13 + j
+        fill = fills["odd"] if j % 2 == 0 else fills["even"]
+        lbl  = ws.cell(row=row, column=2, value=label)
+        lbl.font = fonts["bold"] if is_sub else fonts["data"]
+        lbl.fill = fill
+        if is_sub:
+            lbl.border = border_accent
+        for i, fy in enumerate(fy_list[-5:]):
+            raw = data["annual"].get(fy, {}).get(key, 0)
+            val_display = raw if "pct" in key else raw / 1000
+            c = ws.cell(row=row, column=3+i, value=val_display)
+            c.font  = fonts["bold"] if is_sub else fonts["data"]
+            c.fill  = fill; c.number_format = fmt; c.alignment = right
+            if is_sub:
+                c.border = border_accent
+
+    # Area performance
+    if area_datasets:
+        ar = 23
+        ws.cell(row=ar, column=2, value="AREA PERFORMANCE").font = fonts["section"]
+        hr = ar + 2
+        for i, h in enumerate(["Area", f"Rev {prior_fy}", f"Rev {latest_fy}",
+                                "Growth %", f"GM% {latest_fy}", f"CM% {latest_fy}", "CAGR"]):
+            c = ws.cell(row=hr, column=2+i, value=h)
+            c.font = fonts["header"]; c.fill = fills["header"]; c.alignment = center
+        for j, ad in enumerate(area_datasets):
+            row  = hr + 1 + j
+            fill = fills["odd"] if j % 2 == 0 else fills["even"]
+            ap   = ad["annual"].get(prior_fy,  {})
+            al   = ad["annual"].get(latest_fy, {})
+            rp   = ap.get("total_revenue", 0) / 1000
+            rl   = al.get("total_revenue", 0) / 1000
+            growth = (rl / rp - 1) if rp else 0
+            first_fy = sorted(ad["annual"].keys())[0] if ad["annual"] else prior_fy
+            rf   = ad["annual"].get(first_fy, {}).get("total_revenue", 0) / 1000
+            n    = max(1, int(latest_fy[2:]) - int(first_fy[2:]))
+            cagr = (rl / rf) ** (1 / n) - 1 if rf > 0 else 0
+            row_data = [
+                (ad["display_name"], None,    fonts["data"]),
+                (rp,                 "$#,##0", fonts["data"]),
+                (rl,                 "$#,##0", fonts["data"]),
+                (growth,             "0.0%",   fonts["positive"] if growth > 0 else fonts["negative"]),
+                (al.get("gm_pct",0), "0.0%",   fonts["data"]),
+                (al.get("cm_pct",0), "0.0%",   fonts["data"]),
+                (cagr,               "0.0%",   fonts["positive"] if cagr > 0.15 else fonts["data"]),
+            ]
+            for k, (val, fmt, font) in enumerate(row_data):
+                c = ws.cell(row=row, column=2+k, value=val)
+                c.font = font; c.fill = fill
+                if fmt:
+                    c.number_format = fmt
+                c.alignment = right if k > 0 else Alignment(vertical="center")
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+# ── Main app ──────────────────────────────────────────────────────────────────
+def main():
+    inject_css()
+
+    with st.sidebar:
+        st.markdown(f"### 📊 Executive Dashboard")
+        uploaded = st.file_uploader("Upload P&L Workbook (.xlsx)", type=["xlsx"])
+        if uploaded:
+            st.success(f"✅ {uploaded.name}")
+
+    if not uploaded:
+        st.markdown(f"""
+        <div style="text-align:center; padding:80px 20px;">
+            <h1 style="color:{COLORS['accent']}; font-size:36px;">📊 Executive Dashboard</h1>
+            <p style="color:{COLORS['text_muted']}; font-size:16px; max-width:600px; margin:20px auto;">
+                Upload a P&L workbook to generate your executive dashboard.
+            </p>
+            <p style="color:{COLORS['text_dim']}; font-size:13px;">
+                ← Upload a .xlsx file in the sidebar to get started
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    file_bytes = uploaded.read()
+    wb_tmp = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    sheet_names = wb_tmp.sheetnames
+    wb_tmp.close()
+
+    with st.sidebar:
+        default_idx = 0
+        for i, name in enumerate(sheet_names):
+            nl = name.lower()
+            if "consolidated" in nl and "p&l" in nl:
+                default_idx = i; break
+            elif "consolidated" in nl:
+                default_idx = i
+        selected_sheet = st.selectbox("Consolidated P&L Sheet", sheet_names, index=default_idx)
+
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=selected_sheet, header=None)
+    data = discover_and_extract(df)
+    fy_list = data["fy_labels"]
+
+    if not fy_list:
+        st.error("Could not detect fiscal year columns. Check that your P&L has columns labeled 'FY20XX Total' or similar.")
+        return
+
+    latest_fy = fy_list[-1]
+    prior_fy  = fy_list[-2] if len(fy_list) >= 2 else fy_list[0]
+    latest    = data["annual"].get(latest_fy, {})
+    prior     = data["annual"].get(prior_fy,  {})
+
+    # Area sheets
+    area_sheet_names = discover_area_sheets(sheet_names, selected_sheet)
+    area_datasets = []
+    for an in area_sheet_names:
+        try:
+            adf  = pd.read_excel(io.BytesIO(file_bytes), sheet_name=an, header=None)
+            adata = discover_and_extract(adf)
+            if adata["annual"]:
+                display_name = an
+                for s in ["_P&L", "_PL", " P&L", " PL"]:
+                    display_name = display_name.replace(s, "")
+                adata["display_name"] = display_name.strip()
+                area_datasets.append(adata)
+        except Exception:
+            pass
+    area_datasets.sort(
+        key=lambda x: x["annual"].get(latest_fy, {}).get("total_revenue", 0), reverse=True
+    )
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("**Discovered Structure**")
+        st.markdown(
+            f'<p style="color:{COLORS["text_dim"]};font-size:11px;">'
+            f'Fiscal Years: {", ".join(fy_list)}<br>'
+            f'Service Lines: {len(data["service_lines"])}<br>'
+            f'Monthly Data: {len(data["monthly_revenue"])} FYs<br>'
+            f'Areas Found: {len(area_datasets)}</p>',
+            unsafe_allow_html=True
+        )
+
+    # Build tabs
+    tab_labels = ["📊 Dashboard", "📈 Trends"]
+    if area_datasets:
+        tab_labels.append("🗺️ Areas")
+    tab_labels += ["🎯 Scenarios", "⬇️ Export"]
+    tabs = st.tabs(tab_labels)
+    tab_idx = 0
+
+    # ── Dashboard tab ─────────────────────────────────────────────────────────
+    with tabs[tab_idx]:
+        tab_idx += 1
+        rev      = latest.get("total_revenue", 0)
+        prior_rev = prior.get("total_revenue", 1) or 1
+        growth   = rev / prior_rev - 1
+
+        kpi_items = [
+            ("Total Revenue",       fmt_dollars(rev),          f"PY: {fmt_dollars(prior.get('total_revenue',0))}", COLORS["accent"]),
+            ("Rev Growth YoY",      fmt_growth(growth),        f"PY GM%: {fmt_pct(prior.get('gm_pct',0))}",       COLORS["positive"]),
+            ("Gross Margin %",      fmt_pct(latest.get("gm_pct",0)), f"PY: {fmt_pct(prior.get('gm_pct',0))}",    COLORS["warning"]),
+            ("Contribution Margin", fmt_dollars(latest.get("cm",0)), f"PY: {fmt_dollars(prior.get('cm',0))}",     COLORS["accent_alt"]),
+            ("CM %",                fmt_pct(latest.get("cm_pct",0)), f"PY: {fmt_pct(prior.get('cm_pct',0))}",    COLORS["negative"]),
+        ]
+        cols = st.columns(5)
+        for col, (label, value, sub, bc) in zip(cols, kpi_items):
+            with col:
+                st.markdown(kpi_card(label, value, sub, bc), unsafe_allow_html=True)
+
+        st.markdown("")
+
+        # Service line table
+        if data["service_lines"]:
+            st.markdown(f'<div class="section-title">SERVICE LINE PERFORMANCE — {latest_fy} vs {prior_fy}</div>', unsafe_allow_html=True)
+            sl_df = pd.DataFrame(data["service_lines"])
+            if prior_fy in sl_df.columns and latest_fy in sl_df.columns:
+                disp = sl_df[["name", prior_fy, latest_fy]].copy()
+                disp.columns = ["Service Line", prior_fy, latest_fy]
+                disp[prior_fy]  /= 1000
+                disp[latest_fy] /= 1000
+                disp["Variance"] = disp[latest_fy] - disp[prior_fy]
+                disp["Var %"]    = ((disp["Variance"] / disp[prior_fy]) * 100).map(lambda x: f"{x:+.1f}%")
+                st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        # Annual summary
+        st.markdown(f'<div class="section-title">ANNUAL FINANCIAL SUMMARY</div>', unsafe_allow_html=True)
+        summary_rows = []
+        for label, key in [
+            ("Total Revenue","total_revenue"),("Cost of Services","total_cos"),
+            ("Gross Margin","total_gm"),("GM %","gm_pct"),("Direct Costs","total_direct"),
+            ("Contribution Margin","cm"),("CM %","cm_pct"),("Operating Income","oi"),
+        ]:
+            row = {"Metric": label}
+            for fy in fy_list:
+                v = data["annual"].get(fy, {}).get(key, 0)
+                row[fy] = f"{v*100:.1f}%" if "pct" in key else fmt_dollars(v)
+            summary_rows.append(row)
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        # Revenue mix charts
+        st.markdown(f'<div class="section-title">REVENUE MIX</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        for col, fy in [(c1, prior_fy), (c2, latest_fy)]:
+            sls = [sl for sl in data["service_lines"] if sl.get(fy, 0) > 0]
+            if sls:
+                fig = go.Figure(data=[go.Pie(
+                    labels=[s["name"] for s in sls],
+                    values=[s[fy]/1000 for s in sls],
+                    hole=0.45, textinfo="percent",
+                    textfont=dict(color="white", size=11),
+                    marker=dict(colors=CHART_COLORS[:len(sls)])
+                )])
+                fig.update_layout(**plotly_base(f"Revenue Mix — {fy}", height=300))
+                with col:
+                    st.plotly_chart(fig, use_container_width=True)
+
+        # P&L bridge + cost efficiency
+        st.markdown(f'<div class="section-title">P&L BRIDGE &amp; COST EFFICIENCY</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        fys3 = fy_list[-3:]
+        bridge_fig = go.Figure()
+        for i, fy in enumerate(fys3):
+            a = data["annual"].get(fy, {})
+            bridge_fig.add_trace(go.Bar(
+                x=["Revenue", "Gross Margin", "CM"],
+                y=[a.get("total_revenue",0)/1000, a.get("total_gm",0)/1000, a.get("cm",0)/1000],
+                name=fy, marker_color=CHART_COLORS[2+i]
+            ))
+        bridge_fig.update_layout(**plotly_base("P&L Bridge"))
+        bridge_fig.update_layout(barmode="group")
+        with c1:
+            st.plotly_chart(bridge_fig, use_container_width=True)
+
+        eff_fig = go.Figure()
+        for i, fy in enumerate(fys3):
+            a = data["annual"].get(fy, {})
+            r = a.get("total_revenue", 1) or 1
+            eff_fig.add_trace(go.Bar(
+                x=["COS %", "Direct %", "Total %"],
+                y=[a.get("total_cos",0)/r*100, a.get("total_direct",0)/r*100,
+                   (a.get("total_cos",0)+a.get("total_direct",0))/r*100],
+                name=fy, marker_color=CHART_COLORS[2+i]
+            ))
+        eff_fig.update_layout(**plotly_base("Cost as % of Revenue"))
+        eff_fig.update_layout(barmode="group")
+        eff_fig.update_yaxes(ticksuffix="%")
+        with c2:
+            st.plotly_chart(eff_fig, use_container_width=True)
+
+    # ── Trends tab ────────────────────────────────────────────────────────────
+    with tabs[tab_idx]:
+        tab_idx += 1
+        months = data["month_labels"]
+
+        st.markdown(f'<div class="section-title">MONTHLY REVENUE TREND</div>', unsafe_allow_html=True)
+        fig = go.Figure()
+        for i, (fy, vals) in enumerate(sorted(data["monthly_revenue"].items())):
+            fig.add_trace(go.Scatter(
+                x=months, y=[v/1000 for v in vals], name=fy,
+                line=dict(color=CHART_COLORS[i % len(CHART_COLORS)], width=2),
+                mode="lines+markers", marker=dict(size=4)
+            ))
+        fig.update_layout(**plotly_base("Monthly Revenue Trend", height=320))
+        st.plotly_chart(fig, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        for col, metric_data, title, ylabel in [
+            (c1, data["monthly_gm_pct"],  "Gross Margin % Trend",        "GM %"),
+            (c2, data["monthly_cm_pct"],  "Contribution Margin % Trend", "CM %"),
+        ]:
+            fig = go.Figure()
+            for i, (fy, vals) in enumerate(sorted(metric_data.items())):
+                pvals = [v*100 if abs(v)<1 else v for v in vals]
+                fig.add_trace(go.Scatter(
+                    x=months, y=pvals, name=fy,
+                    line=dict(color=CHART_COLORS[i % len(CHART_COLORS)], width=2),
+                    mode="lines+markers", marker=dict(size=4)
+                ))
+            fig.update_layout(**plotly_base(title))
+            fig.update_yaxes(title_text=ylabel, ticksuffix="%")
+            with col:
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(f'<div class="section-title">BUDGET vs PRIOR YEAR — MONTHLY</div>', unsafe_allow_html=True)
+        fig = go.Figure()
+        for i, fy in enumerate(fy_list[-3:]):
+            vals = data["monthly_revenue"].get(fy, [])
+            fig.add_trace(go.Bar(
+                x=months, y=[v/1000 for v in vals], name=fy,
+                marker_color=CHART_COLORS[2 + i]
+            ))
+        fig.update_layout(**plotly_base("Monthly Revenue — Budget vs Prior Year", height=320))
+        fig.update_layout(barmode="group")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Areas tab ─────────────────────────────────────────────────────────────
+    if area_datasets:
+        with tabs[tab_idx]:
+            tab_idx += 1
+            st.markdown(f'<div class="section-title">AREA PERFORMANCE OVERVIEW — {len(area_datasets)} Areas</div>', unsafe_allow_html=True)
+
+            cols_per_row = min(len(area_datasets), 4)
+            for row_start in range(0, len(area_datasets), cols_per_row):
+                cols = st.columns(cols_per_row)
+                for i, col in enumerate(cols):
+                    idx = row_start + i
+                    if idx >= len(area_datasets):
+                        break
+                    ad = area_datasets[idx]
+                    al = ad["annual"].get(latest_fy, {})
+                    ap = ad["annual"].get(prior_fy,  {})
+                    rl = al.get("total_revenue", 0)
+                    rp = ap.get("total_revenue", 1) or 1
+                    g  = (rl / rp - 1) * 100
+                    with col:
+                        st.markdown(
+                            area_card(ad["display_name"], rl, al.get("cm_pct",0), g, AREA_COLORS[idx % len(AREA_COLORS)]),
+                            unsafe_allow_html=True
+                        )
+
+            st.markdown("")
+            c1, c2 = st.columns(2)
+
+            # Revenue comparison
+            area_names = [ad["display_name"] for ad in area_datasets]
+            rev_fig = go.Figure()
+            for i, fy in enumerate(fy_list[-3:]):
+                rev_fig.add_trace(go.Bar(
+                    x=area_names,
+                    y=[ad["annual"].get(fy, {}).get("total_revenue", 0)/1000 for ad in area_datasets],
+                    name=fy, marker_color=CHART_COLORS[2+i]
+                ))
+            rev_fig.update_layout(**plotly_base("Revenue by Area", height=380))
+            rev_fig.update_layout(barmode="group")
+            with c1:
+                st.plotly_chart(rev_fig, use_container_width=True)
+
+            # Revenue share doughnut
+            share_vals = [ad["annual"].get(latest_fy, {}).get("total_revenue", 0)/1000 for ad in area_datasets]
+            share_fig = go.Figure(data=[go.Pie(
+                labels=area_names, values=share_vals, hole=0.45,
+                textinfo="percent+label", textfont=dict(color="white", size=10),
+                marker=dict(colors=AREA_COLORS[:len(area_names)])
+            )])
+            share_fig.update_layout(**plotly_base(f"Revenue Share — {latest_fy}", height=380))
+            with c2:
+                st.plotly_chart(share_fig, use_container_width=True)
+
+            c1, c2 = st.columns(2)
+
+            # CM% comparison
+            cm_fig = go.Figure()
+            for i, fy in enumerate(fy_list[-3:]):
+                cm_fig.add_trace(go.Bar(
+                    x=area_names,
+                    y=[ad["annual"].get(fy, {}).get("cm_pct", 0)*100 for ad in area_datasets],
+                    name=fy, marker_color=CHART_COLORS[2+i]
+                ))
+            cm_fig.update_layout(**plotly_base("CM % by Area", height=380))
+            cm_fig.update_layout(barmode="group")
+            cm_fig.update_yaxes(ticksuffix="%")
+            with c1:
+                st.plotly_chart(cm_fig, use_container_width=True)
+
+            # Revenue growth
+            g_vals = []
+            g_cols = []
+            for ad in area_datasets:
+                rl = ad["annual"].get(latest_fy, {}).get("total_revenue", 0)
+                rp = ad["annual"].get(prior_fy,  {}).get("total_revenue", 1) or 1
+                g = (rl / rp - 1) * 100
+                g_vals.append(g)
+                g_cols.append(COLORS["positive"] if g >= 0 else COLORS["negative"])
+            grow_fig = go.Figure(data=[go.Bar(
+                x=area_names, y=g_vals, marker_color=g_cols,
+                text=[f"{v:+.1f}%" for v in g_vals], textposition="auto",
+                textfont=dict(color="white", size=11)
+            )])
+            grow_fig.update_layout(**plotly_base(f"Revenue Growth — {prior_fy} → {latest_fy}", height=380))
+            grow_fig.update_yaxes(ticksuffix="%")
+            with c2:
+                st.plotly_chart(grow_fig, use_container_width=True)
+
+            # Area table
+            st.markdown(f'<div class="section-title">AREA PERFORMANCE TABLE</div>', unsafe_allow_html=True)
+            area_rows = []
+            for ad in area_datasets:
+                ap = ad["annual"].get(prior_fy,  {})
+                al = ad["annual"].get(latest_fy, {})
+                rp = ap.get("total_revenue", 0) / 1000
+                rl = al.get("total_revenue", 0) / 1000
+                g  = (rl / rp - 1) * 100 if rp else 0
+                first_fy = sorted(ad["annual"].keys())[0]
+                rf = ad["annual"].get(first_fy, {}).get("total_revenue", 0) / 1000
+                n  = max(1, int(latest_fy[2:]) - int(first_fy[2:]))
+                cagr = ((rl / rf) ** (1/n) - 1) * 100 if rf > 0 else 0
+                area_rows.append({
+                    "Area":              ad["display_name"],
+                    f"Rev {prior_fy}":   fmt_dollars(rp*1000),
+                    f"Rev {latest_fy}":  fmt_dollars(rl*1000),
+                    "Growth %":          f"{g:+.1f}%",
+                    f"GM% {latest_fy}":  fmt_pct(al.get("gm_pct",0)),
+                    f"CM% {latest_fy}":  fmt_pct(al.get("cm_pct",0)),
+                    "CAGR":              f"{cagr:.1f}%",
+                })
+            st.dataframe(pd.DataFrame(area_rows), use_container_width=True, hide_index=True)
+
+    # ── Scenarios tab ─────────────────────────────────────────────────────────
+    with tabs[tab_idx]:
+        tab_idx += 1
+        st.markdown(f'<div class="section-title">SCENARIO ANALYSIS — {latest_fy}</div>', unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**▲ Bull Case**")
+            bull_rev = st.slider("Revenue Growth (Bull)", -20.0, 30.0,  5.0, 0.5, key="bull_rev") / 100
+            bull_cos = st.slider("COS % Adj (Bull)",     -10.0, 10.0, -2.0, 0.5, key="bull_cos") / 100
+        with c2:
+            st.markdown("**● Base Case**")
+            st.info(f"Revenue: {fmt_dollars(latest.get('total_revenue',0))}\n\nCM%: {fmt_pct(latest.get('cm_pct',0))}")
+        with c3:
+            st.markdown("**▼ Bear Case**")
+            bear_rev = st.slider("Revenue Growth (Bear)", -30.0, 10.0, -10.0, 0.5, key="bear_rev") / 100
+            bear_cos = st.slider("COS % Adj (Bear)",       -5.0, 15.0,   3.0, 0.5, key="bear_cos") / 100
+
+        bull = compute_scenario(latest, bull_rev, bull_cos)
+        base = compute_scenario(latest, 0, 0)
+        bear = compute_scenario(latest, bear_rev, bear_cos)
+
+        scen_df = pd.DataFrame([
+            {"Scenario":"▲ Bull", "Revenue":fmt_dollars(bull["revenue"]*1000), "GM":fmt_dollars(bull["gm"]*1000), "CM":fmt_dollars(bull["cm"]*1000), "CM %":fmt_pct(bull["cm_pct"])},
+            {"Scenario":"● Base", "Revenue":fmt_dollars(base["revenue"]*1000), "GM":fmt_dollars(base["gm"]*1000), "CM":fmt_dollars(base["cm"]*1000), "CM %":fmt_pct(base["cm_pct"])},
+            {"Scenario":"▼ Bear", "Revenue":fmt_dollars(bear["revenue"]*1000), "GM":fmt_dollars(bear["gm"]*1000), "CM":fmt_dollars(bear["cm"]*1000), "CM %":fmt_pct(bear["cm_pct"])},
+        ])
+        st.dataframe(scen_df, use_container_width=True, hide_index=True)
+
+        fig = go.Figure()
+        for s, color, label in [(bull, COLORS["positive"],"Bull"), (base, COLORS["accent_alt"],"Base"), (bear, COLORS["negative"],"Bear")]:
+            fig.add_trace(go.Bar(
+                x=["Revenue","Gross Margin","Contribution Margin"],
+                y=[s["revenue"], s["gm"], s["cm"]],
+                name=label, marker_color=color
+            ))
+        fig.update_layout(**plotly_base("Scenario Comparison"))
+        fig.update_layout(barmode="group")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Sensitivity matrix heatmap
+        st.markdown(f'<div class="section-title">CM % SENSITIVITY — Revenue Growth vs COS Adjustment</div>', unsafe_allow_html=True)
+        rev_steps = [-0.10, -0.05, 0, 0.05, 0.10]
+        cos_steps = [-0.03, -0.01,  0, 0.02,  0.05]
+        matrix = [[compute_scenario(latest, r, c)["cm_pct"] * 100 for c in cos_steps] for r in rev_steps]
+        heat_fig = go.Figure(data=go.Heatmap(
+            z=matrix,
+            x=[f"{c*100:+.0f}% COS" for c in cos_steps],
+            y=[f"{r*100:+.0f}% Rev" for r in rev_steps],
+            colorscale=[[0, COLORS["negative"]], [0.4, COLORS["warning"]], [0.6, COLORS["accent_alt"]], [1, COLORS["positive"]]],
+            text=[[f"{v:.1f}%" for v in row] for row in matrix],
+            texttemplate="%{text}", textfont=dict(size=12, color="white"),
+        ))
+        heat_fig.update_layout(**plotly_base("", height=360))
+        heat_fig.update_layout(
+            xaxis=dict(title="COS % Adjustment", side="top"),
+            yaxis=dict(title="Revenue Growth Adjustment", autorange="reversed")
+        )
+        st.plotly_chart(heat_fig, use_container_width=True)
+
+    # ── Export tab ────────────────────────────────────────────────────────────
+    with tabs[tab_idx]:
+        st.markdown(f'<div class="section-title">DOWNLOAD EXCEL DASHBOARD</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<p style="color:{COLORS["text_muted"]}">Download your original workbook with a new '
+            f'<strong>Dashboard</strong> sheet prepended, including KPI scorecards, annual financial '
+            f'summary, and area performance table.</p>',
+            unsafe_allow_html=True
+        )
+        if st.button("🔧 Generate Excel Dashboard", type="primary"):
+            with st.spinner("Building Excel dashboard..."):
+                excel_bytes = generate_excel(data, area_datasets, file_bytes)
+            st.download_button(
+                label="⬇️ Download Dashboard Workbook",
+                data=excel_bytes,
+                file_name=f"Executive_Dashboard_{uploaded.name}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            st.success("✅ Dashboard generated! Click above to download.")
+        st.markdown(
+            f'<p style="color:{COLORS["text_dim"]};font-size:11px;margin-top:20px;">'
+            f'Export includes: KPI scorecards, annual financial summary, and area performance table.<br>'
+            f'For fully formula-driven Excel dashboards with 16 charts, use the Claude Excel add-in.</p>',
+            unsafe_allow_html=True
+        )
+
+
+if __name__ == "__main__":
+    main()
